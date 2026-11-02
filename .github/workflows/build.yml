@@ -1,0 +1,64 @@
+name: Build upstream ONNX Runtime for Intel macOS
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    if: github.event.repository.private == false
+    runs-on: macos-15-intel
+    timeout-minutes: 240
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '14.0'
+      OPENBLAS_NUM_THREADS: '1'
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.10'
+          architecture: x64
+      - name: Fetch and verify public upstream source
+        run: |
+          git clone --branch v1.31.0 --depth 1 --recursive --shallow-submodules https://github.com/microsoft/onnxruntime.git onnxruntime
+          test "$(git -C onnxruntime rev-parse HEAD)" = 402979ac1bef89dcd55add41eaa7277c407599eb
+      - name: Install build tools
+        run: python -m pip install 'numpy==2.5.4' packaging setuptools 'wheel==0.48.0' 'cmake>=3.28' ninja
+      - name: Build upstream wheel
+        working-directory: onnxruntime
+        run: >-
+          ./build.sh --config Release --build_wheel --parallel 2 --skip_tests
+          --compile_no_warning_as_error --cmake_extra_defines
+          CMAKE_OSX_ARCHITECTURES=x86_64 CMAKE_OSX_DEPLOYMENT_TARGET=14.0
+      - name: Verify architecture and apply Intel-only wheel tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheel=$(find "$GITHUB_WORKSPACE/onnxruntime/build" -path '*/dist/onnxruntime-1.31.0-*.whl' -print)
+          test -n "$wheel"
+          test "$(printf '%s\n' "$wheel" | wc -l | tr -d ' ')" = 1
+          python -c 'import sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); n=[x for x in z.namelist() if x.endswith(".so") and "onnxruntime_pybind11_state" in x]; assert len(n)==1; open(sys.argv[2],"wb").write(z.read(n[0]))' "$wheel" "$RUNNER_TEMP/onnxruntime-state.so"
+          lipo "$RUNNER_TEMP/onnxruntime-state.so" -verify_arch x86_64
+          wheel_dir=$(dirname "$wheel")
+          wheel_name=$(basename "$wheel")
+          case "$wheel_name" in
+            *macosx_14_0_x86_64.whl) tagged="$wheel_name" ;;
+            *)
+              (cd "$wheel_dir" && python -m wheel tags --platform-tag=macosx_14_0_x86_64 "$wheel_name" > "$RUNNER_TEMP/tagged-name.txt")
+              tagged=$(tail -n 1 "$RUNNER_TEMP/tagged-name.txt")
+              ;;
+          esac
+          case "$tagged" in *macosx_14_0_x86_64.whl) ;; *) exit 1 ;; esac
+          mkdir output
+          cp "$wheel_dir/$tagged" output/
+          shasum -a 256 output/*.whl > output/SHA256SUMS.txt
+          git -C onnxruntime rev-parse HEAD > output/UPSTREAM-COMMIT.txt
+      - name: Save public wheel for one day
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-onnxruntime-1.31.0-macos-x86_64
+          path: output/
+          retention-days: 1
+          if-no-files-found: error
+      - name: Check Intel import
+        run: |
+          python -m pip install output/*.whl
+          python -c 'import onnxruntime,platform; assert platform.machine()=="x86_64"; assert onnxruntime.__version__=="1.31.0"; assert "CPUExecutionProvider" in onnxruntime.get_available_providers(); print("Intel ONNX Runtime import passed")'
