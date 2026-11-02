@@ -7,11 +7,16 @@ on:
         description: Build the native ARM64 NCHWc verification candidate instead of Intel
         default: false
         required: false
+      arm_reduction8:
+        type: boolean
+        description: Apply the generic eight-channel reduction verification patch on ARM64
+        default: false
+        required: false
 permissions:
   contents: read
 jobs:
   build:
-    if: github.event.repository.private == false && !inputs.arm_nchwc
+    if: github.event.repository.private == false && !inputs.arm_nchwc && !inputs.arm_reduction8
     runs-on: macos-15-intel
     timeout-minutes: 240
     env:
@@ -69,7 +74,7 @@ jobs:
           python -m pip install output/*.whl
           python -c 'import onnxruntime,platform; assert platform.machine()=="x86_64"; assert onnxruntime.__version__=="1.31.0"; assert "CPUExecutionProvider" in onnxruntime.get_available_providers(); print("Intel ONNX Runtime import passed")'
   arm_nchwc:
-    if: github.event.repository.private == false && inputs.arm_nchwc
+    if: github.event.repository.private == false && (inputs.arm_nchwc || inputs.arm_reduction8)
     runs-on: macos-15
     timeout-minutes: 240
     env:
@@ -84,6 +89,21 @@ jobs:
         run: |
           git clone --branch v1.31.0 --depth 1 --recursive --shallow-submodules https://github.com/microsoft/onnxruntime.git onnxruntime
           test "$(git -C onnxruntime rev-parse HEAD)" = 402979ac1bef89dcd55add41eaa7277c407599eb
+      - name: Apply optional generic reduction-order verification patch
+        if: inputs.arm_reduction8
+        working-directory: onnxruntime
+        run: |
+          python - <<'PY'
+          import hashlib
+          from pathlib import Path
+          import subprocess
+          source = Path('onnxruntime/core/mlas/lib/sconv_nchwc_kernel_neon.cpp')
+          assert hashlib.sha256(source.read_bytes()).hexdigest() == 'e75ca19cfda9a55764328436b986c982c139c80f9e1ca20acf8b97b3c178cd3b'
+          patch = '--- a/onnxruntime/core/mlas/lib/sconv_nchwc_kernel_neon.cpp\n+++ b/onnxruntime/core/mlas/lib/sconv_nchwc_kernel_neon.cpp\n@@ -20,6 +20,13 @@\n #include "sconv_nchwc_kernel_neon.h"\n \n constexpr size_t BlockSize = MLAS_PLATFORM::MLAS_NEON_NCHWC_BLOCK_SIZE;\n+#if defined(MLAS_ARM_NEON_REDUCTION8)\n+// Preserve the physical NCHWc16 layout while matching an eight-channel\n+// floating-point reduction order. The option is off unless requested explicitly.\n+constexpr size_t ReductionBlock = 8;\n+#else\n+constexpr size_t ReductionBlock = BlockSize;\n+#endif\n \n // Common implementation for NCHW and NCHWC convolution kernels\n template <bool IsNchwcFormat>\n@@ -92,6 +99,18 @@\n                 BiasVector3 = MlasLoadFloat32x4(&Bias[filterSetBlock * BlockSize + 12]);\n             }\n \n+            const size_t ReductionCount = IsNchwcFormat ? BlockSize / ReductionBlock : 1;\n+            for (size_t reduction_part = 0; reduction_part < ReductionCount; ++reduction_part) {\n+                if (reduction_part != 0) {\n+                    OldOutput0 = Accumulator0;\n+                    OldOutput1 = Accumulator1;\n+                    OldOutput2 = Accumulator2;\n+                    OldOutput3 = Accumulator3;\n+                    Accumulator0 = ZeroVector;\n+                    Accumulator1 = ZeroVector;\n+                    Accumulator2 = ZeroVector;\n+                    Accumulator3 = ZeroVector;\n+                }\n             for (size_t kernel_pos = 0; kernel_pos < KernelHeight * KernelWidth; kernel_pos++) {\n                 size_t kh = kernel_pos / KernelWidth;\n                 size_t kw = kernel_pos % KernelWidth;\n@@ -100,7 +119,8 @@\n                                           kh * DilatedInputWidthElements + kw * DilationWidthElements;\n \n                 if constexpr (IsNchwcFormat) {\n-                    for (size_t filterBlock = 0; filterBlock < BlockSize; filterBlock++) {\n+                    for (size_t filterBlock = reduction_part * ReductionBlock;\n+                         filterBlock < (reduction_part + 1) * ReductionBlock; filterBlock++) {\n                         const float* input_element = input_base + filterBlock;\n                         const float* input_row_start = InputBase + kh * DilatedInputWidthElements;\n                         const float* input_row_end = input_row_start + InputWidthElements;\n@@ -155,10 +175,11 @@\n                 }\n             }\n \n-            Accumulator0 = MlasAddFloat32x4(Accumulator0, MlasAndFloat32x4(OldOutput0, AccumulateMask));\n-            Accumulator1 = MlasAddFloat32x4(Accumulator1, MlasAndFloat32x4(OldOutput1, AccumulateMask));\n-            Accumulator2 = MlasAddFloat32x4(Accumulator2, MlasAndFloat32x4(OldOutput2, AccumulateMask));\n-            Accumulator3 = MlasAddFloat32x4(Accumulator3, MlasAndFloat32x4(OldOutput3, AccumulateMask));\n+            Accumulator0 = MlasAddFloat32x4(Accumulator0, reduction_part == 0 ? MlasAndFloat32x4(OldOutput0, AccumulateMask) : OldOutput0);\n+            Accumulator1 = MlasAddFloat32x4(Accumulator1, reduction_part == 0 ? MlasAndFloat32x4(OldOutput1, AccumulateMask) : OldOutput1);\n+            Accumulator2 = MlasAddFloat32x4(Accumulator2, reduction_part == 0 ? MlasAndFloat32x4(OldOutput2, AccumulateMask) : OldOutput2);\n+            Accumulator3 = MlasAddFloat32x4(Accumulator3, reduction_part == 0 ? MlasAndFloat32x4(OldOutput3, AccumulateMask) : OldOutput3);\n+            } // Bias and activation are applied after both reduction halves.\n \n             Accumulator0 = MlasAddFloat32x4(Accumulator0, MlasAndFloat32x4(BiasVector0, BiasMask));\n             Accumulator1 = MlasAddFloat32x4(Accumulator1, MlasAndFloat32x4(BiasVector1, BiasMask));\n@@ -264,7 +285,7 @@\n         unsigned KernelFlags\n     )\n {\n-#if defined(MLAS_TARGET_ARM64) && defined(MLAS_USE_ARM_NEON_NCHWC) && !defined(_WIN32)\n+#if defined(MLAS_TARGET_ARM64) && defined(MLAS_USE_ARM_NEON_NCHWC) && !defined(_WIN32) && !defined(MLAS_ARM_NEON_REDUCTION8)\n     MlasConvNchwcFloatKernelNeonAsm(\n         Input,\n         Filter,\n'
+          subprocess.run(['git', '-c', 'core.autocrlf=false', 'apply', '--check', '-'], input=patch.encode(), check=True)
+          subprocess.run(['git', '-c', 'core.autocrlf=false', 'apply', '-'], input=patch.encode(), check=True)
+          assert hashlib.sha256(source.read_bytes()).hexdigest() == '9052d33f0d36cc082300a57afbe0f065f5981dfe54766c586bfbefb1382865c9'
+          PY
       - name: Install build tools
         run: python -m pip install 'numpy==2.5.4' packaging setuptools 'wheel==0.48.0' 'cmake>=3.28' ninja
       - name: Build ARM64 NCHWc verification candidate
@@ -93,6 +113,7 @@ jobs:
           --compile_no_warning_as_error --cmake_extra_defines
           CMAKE_OSX_ARCHITECTURES=arm64 CMAKE_OSX_DEPLOYMENT_TARGET=14.0
           onnxruntime_USE_ARM_NEON_NCHWC=ON
+          CMAKE_CXX_FLAGS="${{ inputs.arm_reduction8 && '-DMLAS_ARM_NEON_REDUCTION8=1' || '' }}"
       - name: Verify architecture and apply ARM64-only wheel tag
         shell: bash
         run: |
@@ -116,11 +137,12 @@ jobs:
           cp "$wheel_dir/$tagged" output/
           shasum -a 256 output/*.whl > output/SHA256SUMS.txt
           git -C onnxruntime rev-parse HEAD > output/UPSTREAM-COMMIT.txt
-          printf '%s\n' 'onnxruntime_USE_ARM_NEON_NCHWC=ON' > output/BUILD-OPTIONS.txt
+          printf '%s\n' 'onnxruntime_USE_ARM_NEON_NCHWC=ON' 'MLAS_ARM_NEON_REDUCTION8=${{ inputs.arm_reduction8 }}' > output/BUILD-OPTIONS.txt
+          git -C onnxruntime diff -- onnxruntime/core/mlas/lib/sconv_nchwc_kernel_neon.cpp > output/UPSTREAM-REDUCTION8.patch
       - name: Save ARM64 verification wheel for one day
         uses: actions/upload-artifact@v4
         with:
-          name: upstream-onnxruntime-1.31.0-macos-arm64-nchwc
+          name: ${{ inputs.arm_reduction8 && 'upstream-onnxruntime-1.31.0-macos-arm64-reduction8' || 'upstream-onnxruntime-1.31.0-macos-arm64-nchwc' }}
           path: output/
           retention-days: 1
           if-no-files-found: error

@@ -21,3 +21,14 @@ candidate from the same upstream revision with the upstream
 runner and skips the Intel job. This candidate is not an accepted application
 runtime: model-output compatibility must be checked separately. No application
 sources, model weights, model outputs or private repository keys are used here.
+
+The optional `arm_reduction8` input applies an explicitly recorded generic MLAS
+kernel patch to the pinned upstream ARM64 source. It retains NCHWc16 storage and
+splits each channel reduction into two eight-channel partial sums. This changes
+floating-point operation ordering and selects the C++ NEON kernel for that entry
+point. Bias and activation remain after the complete reduction. The upstream
+source hash, patched source hash, build option and patch are recorded. This is an
+experimental compatibility candidate, not an accepted runtime; complete numeric
+and performance validation is required separately. The patch contains no
+application code, model data or reference model outputs. The existing Intel
+build and unpatched ARM64 input remain available.
