@@ -14,3 +14,10 @@ The job is restricted to a public repository and uses the standard
 `macos-15-intel` GitHub-hosted runner. The wheel is uploaded before the final
 import check, so a failed smoke test does not discard the compiled result.
 A saved artifact alone does not mean the import check passed.
+
+The optional `arm_nchwc` manual input builds a separate native ARM64 verification
+candidate from the same upstream revision with the upstream
+`onnxruntime_USE_ARM_NEON_NCHWC=ON` option. It uses the free standard `macos-15`
+runner and skips the Intel job. This candidate is not an accepted application
+runtime: model-output compatibility must be checked separately. No application
+sources, model weights, model outputs or private repository keys are used here.
