@@ -12,11 +12,16 @@ on:
         description: Apply the generic eight-channel reduction verification patch on ARM64
         default: false
         required: false
+      arm_layernorm:
+        type: boolean
+        description: Combine reduction8 with a generic eight-lane normalization-order candidate
+        default: false
+        required: false
 permissions:
   contents: read
 jobs:
   build:
-    if: github.event.repository.private == false && !inputs.arm_nchwc && !inputs.arm_reduction8
+    if: github.event.repository.private == false && !inputs.arm_nchwc && !inputs.arm_reduction8 && !inputs.arm_layernorm
     runs-on: macos-15-intel
     timeout-minutes: 240
     env:
@@ -74,7 +79,7 @@ jobs:
           python -m pip install output/*.whl
           python -c 'import onnxruntime,platform; assert platform.machine()=="x86_64"; assert onnxruntime.__version__=="1.31.0"; assert "CPUExecutionProvider" in onnxruntime.get_available_providers(); print("Intel ONNX Runtime import passed")'
   arm_nchwc:
-    if: github.event.repository.private == false && (inputs.arm_nchwc || inputs.arm_reduction8)
+    if: github.event.repository.private == false && (inputs.arm_nchwc || inputs.arm_reduction8 || inputs.arm_layernorm)
     runs-on: macos-15
     timeout-minutes: 240
     env:
@@ -90,7 +95,7 @@ jobs:
           git clone --branch v1.31.0 --depth 1 --recursive --shallow-submodules https://github.com/microsoft/onnxruntime.git onnxruntime
           test "$(git -C onnxruntime rev-parse HEAD)" = 402979ac1bef89dcd55add41eaa7277c407599eb
       - name: Apply optional generic reduction-order verification patch
-        if: inputs.arm_reduction8
+        if: inputs.arm_reduction8 || inputs.arm_layernorm
         working-directory: onnxruntime
         run: |
           python - <<'PY'
@@ -104,6 +109,21 @@ jobs:
           subprocess.run(['git', '-c', 'core.autocrlf=false', 'apply', '-'], input=patch.encode(), check=True)
           assert hashlib.sha256(source.read_bytes()).hexdigest() == '9052d33f0d36cc082300a57afbe0f065f5981dfe54766c586bfbefb1382865c9'
           PY
+      - name: Apply optional generic normalization-order verification patch
+        if: inputs.arm_layernorm
+        working-directory: onnxruntime
+        run: |
+          python - <<'PY'
+          import hashlib
+          from pathlib import Path
+          import subprocess
+          source = Path('onnxruntime/core/mlas/lib/layernorm.cpp')
+          assert hashlib.sha256(source.read_bytes()).hexdigest() == 'ab1412dbf1db1c64bb80d066093a737c3fc2fed9b787f4c1f35cd1fce154a4c4'
+          patch = '--- a/onnxruntime/core/mlas/lib/layernorm.cpp\n+++ b/onnxruntime/core/mlas/lib/layernorm.cpp\n@@ -16,6 +16,61 @@\n --*/\n \n #include "mlasi.h"\n+#include <cmath>\n+\n+#if defined(MLAS_TARGET_ARM64) && defined(MLAS_ARM_AVX2_LAYERNORM)\n+static void LayerNormEightLaneOrder(\n+    const float* Input, const float* Scale, const float* Bias, float* Output,\n+    float* MeanOut, float* InvStdDevOut, size_t n, float Epsilon, bool Simplified)\n+{\n+    double sums[4] = {};\n+    float squares[8] = {};\n+    float mean = 0.0f;\n+    size_t i = 0;\n+    if (!Simplified || MeanOut != nullptr) {\n+        for (; i + 4 <= n; i += 4) {\n+            for (size_t lane = 0; lane < 4; ++lane) {\n+                sums[lane] += static_cast<double>(Input[i + lane]);\n+            }\n+        }\n+        double total = (sums[0] + sums[2]) + (sums[1] + sums[3]);\n+        for (; i < n; ++i) total += static_cast<double>(Input[i]);\n+        mean = static_cast<float>(total / static_cast<double>(n));\n+    }\n+    i = 0;\n+    for (; i + 8 <= n; i += 8) {\n+        for (size_t lane = 0; lane < 8; ++lane) {\n+            float value = Simplified ? Input[i + lane] : Input[i + lane] - mean;\n+            squares[lane] = std::fma(value, value, squares[lane]);\n+        }\n+    }\n+    float total = ((squares[0] + squares[4]) + (squares[2] + squares[6])) +\n+                  ((squares[1] + squares[5]) + (squares[3] + squares[7]));\n+    for (; i < n; ++i) {\n+        float value = Simplified ? Input[i] : Input[i] - mean;\n+        total += value * value;\n+    }\n+    float inverse = 1.0f / std::sqrt(total / static_cast<float>(n) + Epsilon);\n+    i = 0;\n+    for (; i + 8 <= n; i += 8) {\n+        for (size_t lane = 0; lane < 8; ++lane) {\n+            const size_t at = i + lane;\n+            float value = Simplified ? Input[at] : Input[at] - mean;\n+            value = value * inverse;\n+            Output[at] = !Simplified && Bias != nullptr\n+                ? std::fma(value, Scale[at], Bias[at]) : value * Scale[at];\n+        }\n+    }\n+    for (; i < n; ++i) {\n+        float value = Simplified ? Input[i] : Input[i] - mean;\n+        value = value * inverse * Scale[i];\n+        Output[i] = !Simplified && Bias != nullptr ? value + Bias[i] : value;\n+    }\n+    if (MeanOut != nullptr) *MeanOut = mean;\n+    if (InvStdDevOut != nullptr) *InvStdDevOut = inverse;\n+}\n+\n+#endif\n \n bool\n     MLASCALL\n@@ -31,6 +86,13 @@\n         bool Simplified\n     )\n {\n+#if defined(MLAS_TARGET_ARM64) && defined(MLAS_ARM_AVX2_LAYERNORM)\n+    if (NormSize >= (Simplified ? 16u : 8u)) {\n+        LayerNormEightLaneOrder(Input, Scale, Bias, Output, MeanOut, InvStdDevOut,\n+                                NormSize, Epsilon, Simplified);\n+        return true;\n+    }\n+#endif\n     auto kernel = GetMlasPlatform().LayerNormF32Kernel;\n     if (kernel == nullptr) {\n         return false;\n'
+          subprocess.run(['git', '-c', 'core.autocrlf=false', 'apply', '--check', '-'], input=patch.encode(), check=True)
+          subprocess.run(['git', '-c', 'core.autocrlf=false', 'apply', '-'], input=patch.encode(), check=True)
+          assert hashlib.sha256(source.read_bytes()).hexdigest() == '357e98dc7c4b97f96b56d55e44ebdb063964d25f46cd75769e316932e669b24b'
+          PY
       - name: Install build tools
         run: python -m pip install 'numpy==2.5.4' packaging setuptools 'wheel==0.48.0' 'cmake>=3.28' ninja
       - name: Build ARM64 NCHWc verification candidate
@@ -113,7 +133,7 @@ jobs:
           --compile_no_warning_as_error --cmake_extra_defines
           CMAKE_OSX_ARCHITECTURES=arm64 CMAKE_OSX_DEPLOYMENT_TARGET=14.0
           onnxruntime_USE_ARM_NEON_NCHWC=ON
-          CMAKE_CXX_FLAGS="${{ inputs.arm_reduction8 && '-DMLAS_ARM_NEON_REDUCTION8=1' || '' }}"
+          CMAKE_CXX_FLAGS="${{ inputs.arm_layernorm && '-DMLAS_ARM_NEON_REDUCTION8=1 -DMLAS_ARM_AVX2_LAYERNORM=1' || inputs.arm_reduction8 && '-DMLAS_ARM_NEON_REDUCTION8=1' || '' }}"
       - name: Verify architecture and apply ARM64-only wheel tag
         shell: bash
         run: |
@@ -137,12 +157,13 @@ jobs:
           cp "$wheel_dir/$tagged" output/
           shasum -a 256 output/*.whl > output/SHA256SUMS.txt
           git -C onnxruntime rev-parse HEAD > output/UPSTREAM-COMMIT.txt
-          printf '%s\n' 'onnxruntime_USE_ARM_NEON_NCHWC=ON' 'MLAS_ARM_NEON_REDUCTION8=${{ inputs.arm_reduction8 }}' > output/BUILD-OPTIONS.txt
+          printf '%s\n' 'onnxruntime_USE_ARM_NEON_NCHWC=ON' 'MLAS_ARM_NEON_REDUCTION8=${{ inputs.arm_reduction8 || inputs.arm_layernorm }}' 'MLAS_ARM_AVX2_LAYERNORM=${{ inputs.arm_layernorm }}' > output/BUILD-OPTIONS.txt
           git -C onnxruntime diff -- onnxruntime/core/mlas/lib/sconv_nchwc_kernel_neon.cpp > output/UPSTREAM-REDUCTION8.patch
+          git -C onnxruntime diff -- onnxruntime/core/mlas/lib/layernorm.cpp > output/UPSTREAM-LAYERNORM.patch
       - name: Save ARM64 verification wheel for one day
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.arm_reduction8 && 'upstream-onnxruntime-1.31.0-macos-arm64-reduction8' || 'upstream-onnxruntime-1.31.0-macos-arm64-nchwc' }}
+          name: ${{ inputs.arm_layernorm && 'upstream-onnxruntime-1.31.0-macos-arm64-layernorm' || inputs.arm_reduction8 && 'upstream-onnxruntime-1.31.0-macos-arm64-reduction8' || 'upstream-onnxruntime-1.31.0-macos-arm64-nchwc' }}
           path: output/
           retention-days: 1
           if-no-files-found: error

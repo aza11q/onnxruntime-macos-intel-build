@@ -32,3 +32,12 @@ experimental compatibility candidate, not an accepted runtime; complete numeric
 and performance validation is required separately. The patch contains no
 application code, model data or reference model outputs. The existing Intel
 build and unpatched ARM64 input remain available.
+
+The optional `arm_layernorm` input combines reduction8 with an explicitly
+recorded generic LayerNorm/RMSNorm arithmetic candidate. It uses a four-lane
+double-precision mean, an eight-lane centered fused variance reduction, and
+the corresponding scale/bias arithmetic order. It is selected only on ARM64
+with `MLAS_ARM_AVX2_LAYERNORM=1`; other builds retain upstream dispatch.
+This experimental option is not accepted until complete model-level and
+performance checks pass. The patch contains no application data or model
+parameters. Both upstream patches and their exact source hashes are recorded.
