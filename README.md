@@ -41,3 +41,11 @@ with `MLAS_ARM_AVX2_LAYERNORM=1`; other builds retain upstream dispatch.
 This experimental option is not accepted until complete model-level and
 performance checks pass. The patch contains no application data or model
 parameters. Both upstream patches and their exact source hashes are recorded.
+
+The optional `arm_layernorm16` input applies the same generic ordered
+normalization to FP16 input/output, using the original MLAS half conversions.
+Its full-model numerical acceptance is still required separately. This option
+retains the prior F32 candidate as a separate input and records the complete
+generic source patch. Public upstream compiler objects now use a compiler-keyed
+ccache capped at 2 GB, containing no application files or model data. Cache
+billing settings are not changed. Standard public runners remain in use.
